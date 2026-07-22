@@ -27,10 +27,9 @@ def build(strategy: str = 'none') -> Optimizer:
         batteries=[BatteryConfig(charge_from_grid=True, discharge_to_grid=False,
                                  s_capacity=5000, s_min=0, s_max=5000, s_initial=0,
                                  c_min=1000, c_max=2000, d_max=0, p_a=0,
-                                 s_goal=[0, 0, 0, 0, 0, 1500])],
+                                 s_goal=[0, 0, 0, 0, 0, 1500], eta_c=1, eta_d=1)],
         time_series=TimeSeriesData(dt=[900] * 6, gt=[0] * 6, ft=[0] * 6,
                                    p_N=[0.001] + [0.0003] * 5, p_E=[0] * 6),
-        eta_c=1, eta_d=1,
     )
 
 

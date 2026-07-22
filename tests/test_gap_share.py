@@ -7,7 +7,7 @@ def test_the_gap_grows_with_the_goal_energy():
     # a fixed cent sits below the relaxation slack of a vehicle with c_min and a charge goal (#186),
     # so the gap follows the money the request moves and keeps the cent as its floor
     model = build('024-attenuate-demand-peaks')
-    need = sum(max(max(bat.s_goal) - bat.s_initial, 0.) / model.eta_c for bat in model.batteries if bat.s_goal)
+    need = sum(max(max(bat.s_goal) - bat.s_initial, 0.) / bat.eta_c for bat in model.batteries if bat.s_goal)
     assert need > 0, 'the case needs a charge goal'
     scaled = model.settings.gap_share * need * numpy.mean(model.time_series.p_N)
 
