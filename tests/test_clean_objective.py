@@ -17,7 +17,7 @@ def build(dt, gt=None, ft=None, s_initial=S_INITIAL, s_max=5000.0, c_max=1000.0,
                                  c_min=0, c_max=c_max, d_max=d_max, p_a=P_A)],
         time_series=TimeSeriesData(dt=dt, gt=gt or [0] * len(dt), ft=ft or [0] * len(dt),
                                    p_N=[P_N] * len(dt), p_E=[P_E] * len(dt)),
-        eta_c=0.95, eta_d=0.95, M=1e6)
+        M=1e6)
 
 
 def economic_value(result, s_initial=S_INITIAL):

@@ -53,9 +53,11 @@ def build(mod, req):
             s_capacity=b.get('s_capacity', b['s_max']), s_min=b['s_min'], s_max=b['s_max'],
             s_initial=b['s_initial'], p_demand=b.get('p_demand'), s_goal=b.get('s_goal'),
             c_min=b['c_min'], c_max=b['c_max'], d_max=b['d_max'], p_a=b['p_a'],
-            c_priority=b.get('c_priority', 0)) for b in req['batteries']],
+            c_priority=b.get('c_priority', 0),
+            eta_c=b.get('eta_c', req.get('eta_c', 0.95)),
+            eta_d=b.get('eta_d', req.get('eta_d', 0.95))) for b in req['batteries']],
         time_series=mod.TimeSeriesData(**req['time_series']),
-        eta_c=req.get('eta_c', 0.95), eta_d=req.get('eta_d', 0.95), M=1e6)
+        M=1e6)
 
 
 def profiles(opt, res):

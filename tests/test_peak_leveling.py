@@ -38,7 +38,7 @@ def build(strategy='attenuate_demand_peaks', dt=None, gt=None, ft=None, c_max=80
                                  s_capacity=40000., s_min=0., s_max=40000., s_initial=8000.,
                                  c_min=0., c_max=c_max, d_max=d_max, p_a=0.0001)],
         time_series=TimeSeriesData(dt=dt, gt=gt, ft=ft, p_N=[0.0003] * n, p_E=[0.0001] * n),
-        eta_c=0.95, eta_d=0.95, M=1e6)
+        M=1e6)
 
 
 def import_power(model, result):

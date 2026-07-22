@@ -243,6 +243,8 @@ class BatteryConfig:
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
     c_active: bool = False  # Whether the device is charging at the start of the horizon
+    eta_c: float = 0.95  # Charging efficiency (0 to 1)
+    eta_d: float = 0.95  # Discharging efficiency (0 to 1)
 
 
 @dataclass
@@ -274,7 +276,7 @@ class Optimizer:
     """
 
     def __init__(self, strategy: OptimizationStrategy, grid: GridConfig, batteries: List[BatteryConfig], time_series: TimeSeriesData,
-                 eta_c: float = 0.95, eta_d: float = 0.95, M: float = 1e6, optimizer_settings: OptimizerSettings | None = None):
+                 M: float = 1e6, optimizer_settings: OptimizerSettings | None = None):
         """
         Optimizer Constructor
         """
@@ -285,8 +287,6 @@ class Optimizer:
         self.grid = grid
         self.batteries = batteries
         self.time_series = time_series
-        self.eta_c = eta_c
-        self.eta_d = eta_d
         self.M = M
         # number of time steps
         self.T = len(time_series.gt)
@@ -759,15 +759,15 @@ class Optimizer:
             if len(self.time_steps) > 0:
                 self.problem += (self.variables['s'][i][0]
                                  == bat.s_initial
-                                 + self.eta_c * self.variables['c'][i][0]
-                                 - (1 / self.eta_d) * self.variables['d'][i][0])
+                                 + bat.eta_c * self.variables['c'][i][0]
+                                 - (1 / bat.eta_d) * self.variables['d'][i][0])
 
             # State of charge evolution
             for t in range(1, self.T):
                 self.problem += (self.variables['s'][i][t]
                                  == self.variables['s'][i][t - 1]
-                                 + self.eta_c * self.variables['c'][i][t]
-                                 - (1 / self.eta_d) * self.variables['d'][i][t])
+                                 + bat.eta_c * self.variables['c'][i][t]
+                                 - (1 / bat.eta_d) * self.variables['d'][i][t])
 
             # Constraint (6): Battery SOC goal constraints (for t > 0)
             if bat.s_goal is not None:
@@ -1237,7 +1237,7 @@ class Optimizer:
         gap = self.settings.gap_abs
         if gap is None or not self.settings.gap_share:
             return gap
-        need = sum(max(max(bat.s_goal) - bat.s_initial, 0.) / self.eta_c for bat in self.batteries if bat.s_goal)
+        need = sum(max(max(bat.s_goal) - bat.s_initial, 0.) / bat.eta_c for bat in self.batteries if bat.s_goal)
         return max(gap, self.settings.gap_share * need * float(np.mean(self.time_series.p_N)))
 
     def _probe_then_split(self, tmpdir, deadline) -> None:

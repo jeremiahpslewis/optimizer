@@ -186,7 +186,9 @@ battery_config_model = api.model('BatteryConfig', {
     'c_active': fields.Boolean(required=False, description='Whether the device is charging at the start of the time horizon.'),
     'd_max': fields.Float(required=True, min=0, description='Maximum discharge power (W)'),
     'p_a': fields.Float(required=True, description='Monetary value per Wh at end of the optimization horizon'),
-    'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.')
+    'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.'),
+    'eta_c': fields.Float(required=False, description='Charging efficiency (0 to 1), overrides the top level default'),
+    'eta_d': fields.Float(required=False, description='Discharging efficiency (0 to 1), overrides the top level default')
 })
 
 time_series_model = api.model('TimeSeries', {
@@ -204,8 +206,8 @@ optimization_input_model = api.model('OptimizationInput', {
     'grid': fields.Nested(grid_model, required=False, description='Grid import and export configuration'),
     'batteries': fields.List(fields.Nested(battery_config_model), required=True, description='Battery configurations'),
     'time_series': fields.Nested(time_series_model, required=True, description='Time series data'),
-    'eta_c': fields.Float(required=False, default=0.95, description='Charging efficiency'),
-    'eta_d': fields.Float(required=False, default=0.95, description='Discharging efficiency'),
+    'eta_c': fields.Float(required=False, default=0.95, description='Default charging efficiency for batteries without their own eta_c'),
+    'eta_d': fields.Float(required=False, default=0.95, description='Default discharging efficiency for batteries without their own eta_d'),
 })
 
 # Output models
@@ -265,6 +267,8 @@ class OptimizeCharging(Resource):
             )
 
             # Parse battery configurations
+            eta_c_default = data.get('eta_c', 0.95)
+            eta_d_default = data.get('eta_d', 0.95)
             batteries = []
             for bat_data in data['batteries']:
                 batteries.append(BatteryConfig(
@@ -282,6 +286,8 @@ class OptimizeCharging(Resource):
                     d_max=bat_data['d_max'],
                     p_a=bat_data['p_a'],
                     c_priority=bat_data.get('c_priority', 0),
+                    eta_c=bat_data.get('eta_c', eta_c_default),
+                    eta_d=bat_data.get('eta_d', eta_d_default),
                 ))
 
             # Parse time series data
@@ -331,8 +337,6 @@ class OptimizeCharging(Resource):
                 grid=grid,
                 batteries=batteries,
                 time_series=time_series,
-                eta_c=data.get('eta_c', 0.95),
-                eta_d=data.get('eta_d', 0.95),
                 M=1e6
             )
 

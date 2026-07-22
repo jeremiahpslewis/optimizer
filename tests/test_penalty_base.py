@@ -16,7 +16,7 @@ def build(prc_p_exc_imp=None, p_a=0.0, p_max_imp=500, dt=None, p_N=None, p_E=Non
                                  s_capacity=s_capacity, s_min=s_min, s_max=s_capacity, s_initial=s_initial,
                                  c_min=0, c_max=0, d_max=d_max, p_a=p_a)],
         time_series=TimeSeriesData(dt=dt, gt=gt, ft=[0] * len(dt), p_N=p_N, p_E=p_E),
-        eta_c=0.95, eta_d=0.95, M=1e6)
+        M=1e6)
 
 
 def test_penalty_base_matches_import_price_when_nothing_else_dominates():
