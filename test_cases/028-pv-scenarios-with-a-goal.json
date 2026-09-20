@@ -1,0 +1,85 @@
+{
+  "request": {
+    "strategy": {
+      "charging_strategy": "none",
+      "discharging_strategy": "none"
+    },
+    "batteries": [
+      {
+        "charge_from_grid": false,
+        "discharge_to_grid": false,
+        "s_capacity": 6000,
+        "s_min": 0,
+        "s_max": 6000,
+        "s_initial": 4000,
+        "s_goal": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          6000
+        ],
+        "c_min": 0,
+        "c_max": 3000,
+        "d_max": 3000,
+        "p_a": 0.0
+      }
+    ],
+    "time_series": {
+      "dt": [
+        3600,
+        3600,
+        3600,
+        3600,
+        3600,
+        3600
+      ],
+      "gt": [
+        3000,
+        500,
+        500,
+        500,
+        500,
+        500
+      ],
+      "ft": [
+        0,
+        2000,
+        4000,
+        2000,
+        0,
+        0
+      ],
+      "p_N": [
+        0.0005,
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003
+      ],
+      "p_E": [
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001
+      ]
+    },
+    "eta_c": 0.95,
+    "eta_d": 0.95,
+    "pv_spread": 0.5,
+    "pv_scenario_weights": [
+      0.1,
+      0.8,
+      0.1
+    ],
+    "prc_e_goal_pen": 0.0006
+  },
+  "expected_response": {
+    "status": "Optimal",
+    "objective_value": -0.192936288
+  }
+}

@@ -1,6 +1,6 @@
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional
 
@@ -138,6 +138,26 @@ class BatteryConfig:
     c_priority: int = 0
 
 
+# probability of the low yield, the expected and the high yield PV scenario. Only read when a
+# spread is given, a spread of 0 keeps the single scenario model.
+DEFAULT_PV_SCENARIO_WEIGHTS = (0.1, 0.8, 0.1)
+
+
+@dataclass
+class PvScenario:
+    """
+    One probability weighted realization of the PV forecast, with its own set of time indexed
+    variables. The first time step is tied across the scenarios, see
+    _add_non_anticipativity_constraints.
+    """
+    weight: float
+    ft: List[float]  # Forecasted production of this scenario [Wh]
+    # appended to every variable name of this scenario. Empty for the single scenario model, so a
+    # request without a spread hands the solver the same model it got before scenarios existed.
+    suffix: str
+    variables: Dict = field(default_factory=dict)
+
+
 @dataclass
 class TimeSeriesData:
     dt: List[int]  # time step length [s]
@@ -154,7 +174,9 @@ class Optimizer:
     """
 
     def __init__(self, strategy: OptimizationStrategy, grid: GridConfig, batteries: List[BatteryConfig], time_series: TimeSeriesData,
-                 eta_c: float = 0.95, eta_d: float = 0.95, M: float = 1e6, optimizer_settings: OptimizerSettings | None = None):
+                 eta_c: float = 0.95, eta_d: float = 0.95, M: float = 1e6, optimizer_settings: OptimizerSettings | None = None,
+                 pv_spread: float = 0.0, pv_scenario_weights: Optional[List[float]] = None,
+                 prc_e_goal_pen: Optional[float] = None):
         """
         Optimizer Constructor
         """
@@ -172,6 +194,12 @@ class Optimizer:
         self.T = len(time_series.gt)
         # time step range
         self.time_steps = range(self.T)
+        # PV scenarios the model plans over, generated from the single forecast of the request
+        self.pv_spread = pv_spread
+        self.scenarios = self._build_scenarios(pv_spread, pv_scenario_weights)
+        # the scenario whose schedule is reported. The expected one, which is the only one when no
+        # spread is given.
+        self.reported_scenario = self.scenarios[len(self.scenarios) // 2]
         # the optimization problem
         self.problem = None
         # factor the objective went to the solver with, set by _setup_target_function
@@ -215,8 +243,13 @@ class Optimizer:
             real_prices_per_wh.append(self.grid.prc_p_exc_imp * 3600. / min(self.time_series.dt))
         self.penalty_base = np.max(real_prices_per_wh + [0.1e-3])
 
-        # scaling for penalty parameters
-        self.prc_e_goal_pen = self.penalty_base * 10e1
+        # scaling for penalty parameters. The goal penalty defaults to a hundred times the largest
+        # real rate in the model, which buys the goal at any price it can be reached at. That is
+        # harmless while the shortfall is zero at the optimum, but a low yield PV scenario leaves
+        # it nonzero, and at this coefficient it then outweighs every real cost term and turns the
+        # expected cost into the worst case. Give prc_e_goal_pen a price per Wh to weigh the
+        # shortfall against money instead.
+        self.prc_e_goal_pen = prc_e_goal_pen if prc_e_goal_pen is not None else self.penalty_base * 10e1
         self.prc_p_goal_pen = self.penalty_base * 10e1
         self.prc_soc_exc_pen = self.penalty_base * 10e2
 
@@ -237,6 +270,39 @@ class Optimizer:
         # grid sides leveled by the active peak attenuation strategy, empty for all other strategies
         self.peak_sides = PEAK_STRATEGY_SIDES.get(strategy.charging_strategy, ())
 
+    def _build_scenarios(self, pv_spread: float, weights: Optional[List[float]]) -> List[PvScenario]:
+        """
+        The PV scenarios to plan over, the forecast of the request scaled by 1 - spread, 1 and
+        1 + spread.
+
+        The first time step keeps the forecast unscaled, it is the step being decided rather than
+        planned: the schedule commits to one set of values for it, and a yield that differs between
+        the scenarios there leaves the energy balance of that step unsatisfiable under that single
+        decision. See _add_non_anticipativity_constraints.
+
+        A spread of 0 returns the forecast as given, in a single scenario of weight 1 and without a
+        name suffix, so that the model built from it is the one built before scenarios existed
+        rather than an equivalent of it.
+        """
+        if not pv_spread:
+            return [PvScenario(weight=1.0, ft=self.time_series.ft, suffix='')]
+
+        weights = list(DEFAULT_PV_SCENARIO_WEIGHTS if weights is None else weights)
+        factors = (1. - pv_spread, 1., 1. + pv_spread)
+        if len(weights) != len(factors):
+            raise ValueError(f"pv_scenario_weights needs one weight per scenario, {len(factors)} in total")
+        if min(weights) < 0 or sum(weights) <= 0:
+            raise ValueError("pv_scenario_weights must be non negative and sum to more than zero")
+
+        # normalized, so the weighted objective stays an expectation and terms on scenario
+        # independent variables keep their coefficient
+        total = sum(weights)
+        return [PvScenario(weight=weight / total,
+                           ft=[yld if t == 0 else yld * factor
+                               for t, yld in enumerate(self.time_series.ft)],
+                           suffix=f'_s{k}')
+                for k, (weight, factor) in enumerate(zip(weights, factors))]
+
     def create_model(self):
         """
         Create and initialize the MILP model
@@ -247,82 +313,19 @@ class Optimizer:
 
         self._setup_variables()
         self._setup_target_function()
-        self._add_energy_balance_constraints()
-        self._add_battery_constraints()
+        for scenario in self.scenarios:
+            self._add_energy_balance_constraints(scenario)
+            self._add_battery_constraints(scenario)
+        self._add_non_anticipativity_constraints()
 
     def _setup_variables(self):
         """
         Set up the variables of the MILP optimizer
         """
 
-        # Charging power variables [Wh]
-        self.variables['c'] = {}
-        for i, bat in enumerate(self.batteries):
-            self.variables['c'][i] = [
-                pulp.LpVariable(f"c_{i}_{t}", lowBound=0, upBound=bat.c_max * self.time_series.dt[t] / 3600.)
-                for t in self.time_steps
-            ]
-
-        # Discharging power variables [Wh]
-        self.variables['d'] = {}
-        for i, bat in enumerate(self.batteries):
-            self.variables['d'][i] = [
-                pulp.LpVariable(f"d_{i}_{t}", lowBound=0, upBound=bat.d_max * self.time_series.dt[t] / 3600.)
-                for t in self.time_steps
-            ]
-
-        # State of charge variables [Wh]
-        self.variables['s'] = {}
-        for i, bat in enumerate(self.batteries):
-            self.variables['s'][i] = [
-                pulp.LpVariable(f"s_{i}_{t}", lowBound=0, upBound=bat.s_capacity)
-                for t in self.time_steps
-            ]
-
-        # penalty variable for not reaching given charge goals
-        # variables are kept in a matrix Batteries X time steps, only those elements will have an
-        # entry != None that have a SOC goal > 0 defined in the input data
-        self.variables['s_goal_pen'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
-        for i, bat in enumerate(self.batteries):
-            if self.batteries[i].s_goal is not None:
-                for t in self.time_steps:
-                    if self.batteries[i].s_goal[t] > 0:
-                        self.variables['s_goal_pen'][i][t] = pulp.LpVariable(f"s_goal_pen_{i}_{t}", lowBound=0)
-
-        # penalty variable for not being able to charge with the required power
-        self.variables['p_demand_pen'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
-        # binary variable to allow one out of two alternative constraints
-        self.variables['z_p_demand'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
-        # binary variable to capture when s_max is reached
-        self.variables['z_s_max_reached'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
-        for i, bat in enumerate(self.batteries):
-            if bat.p_demand is not None:
-                for t in self.time_steps:
-                    self.variables['p_demand_pen'][i][t] = pulp.LpVariable(f"p_demand_pen_{i}_{t}", lowBound=0)
-                    self.variables['z_p_demand'][i][t] = pulp.LpVariable(f"z_p_demand_{i}_{t}", cat='Binary')
-                    self.variables['z_s_max_reached'][i][t] = pulp.LpVariable(f"z_s_max_reached_{i}_{t}", cat='Binary')
-
-        # penalty variable for staying above max SOC and below min SOC
-        self.variables['s_max_pen'] = [[pulp.LpVariable(f"s_max_pen_{i}_{t}", lowBound=0) for t in self.time_steps] for i in range(len(self.batteries))]
-        self.variables['s_min_pen'] = [[pulp.LpVariable(f"s_min_pen_{i}_{t}", lowBound=0) for t in self.time_steps] for i in range(len(self.batteries))]
-
-        # Grid import/export variables [Wh]
-        self.variables['n'] = [pulp.LpVariable(f"n_{t}", lowBound=0) for t in self.time_steps]
-        self.variables['e'] = [pulp.LpVariable(f"e_{t}", lowBound=0) for t in self.time_steps]
-
-        # penalty variables for exceeding grid power limits (W)
-        # for grid import
-        if self.grid.p_max_imp is not None:
-            self.variables['e_imp_lim_exc'] = [pulp.LpVariable(f"p_imp_pen_{t}", lowBound=0) for t in self.time_steps]
-            # binary variable to allow limit exceeding only if the regular import actually hits the limit
-            # this is required to avoid that limit exceeds are shifted to other time steps
-            self.variables['z_imp_lim'] = [pulp.LpVariable(f"z_imp_lim_{t}", cat='Binary') for t in self.time_steps]
-
-        # for grid export
-        if self.grid.p_max_exp is not None:
-            self.variables['e_exp_lim_exc'] = [pulp.LpVariable(f"e_exp_lim_exc_{t}", lowBound=0) for t in self.time_steps]
-            # binary variable to allow limit exceeding only if the regular export actually hits the limit
-            self.variables['z_exp_lim'] = [pulp.LpVariable(f"z_exp_lim_{t}", cat='Binary') for t in self.time_steps]
+        # scenario independent variables. The demand rate peak and the levelled grid peaks are
+        # properties of the horizon rather than of one realization of the forecast, so all
+        # scenarios are bound by the same value and it ends up being the one of the worst of them.
 
         # for demand rate calculation, we need to track the actual maximum import power
         # within the time horizon (W)
@@ -334,36 +337,143 @@ class Optimizer:
         for side in self.peak_sides:
             self.variables[f'p_{side}_peak'] = pulp.LpVariable(f"p_{side}_peak", lowBound=0)
 
+        for scenario in self.scenarios:
+            self._setup_scenario_variables(scenario)
+
+    def _setup_scenario_variables(self, sc: PvScenario):
+        """
+        Set up the time indexed variables of one PV scenario
+        """
+
+        # Charging power variables [Wh]
+        sc.variables['c'] = {}
+        for i, bat in enumerate(self.batteries):
+            sc.variables['c'][i] = [
+                pulp.LpVariable(f"c_{i}_{t}{sc.suffix}", lowBound=0, upBound=bat.c_max * self.time_series.dt[t] / 3600.)
+                for t in self.time_steps
+            ]
+
+        # Discharging power variables [Wh]
+        sc.variables['d'] = {}
+        for i, bat in enumerate(self.batteries):
+            sc.variables['d'][i] = [
+                pulp.LpVariable(f"d_{i}_{t}{sc.suffix}", lowBound=0, upBound=bat.d_max * self.time_series.dt[t] / 3600.)
+                for t in self.time_steps
+            ]
+
+        # State of charge variables [Wh]
+        sc.variables['s'] = {}
+        for i, bat in enumerate(self.batteries):
+            sc.variables['s'][i] = [
+                pulp.LpVariable(f"s_{i}_{t}{sc.suffix}", lowBound=0, upBound=bat.s_capacity)
+                for t in self.time_steps
+            ]
+
+        # penalty variable for not reaching given charge goals
+        # variables are kept in a matrix Batteries X time steps, only those elements will have an
+        # entry != None that have a SOC goal > 0 defined in the input data
+        sc.variables['s_goal_pen'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
+        for i, bat in enumerate(self.batteries):
+            if self.batteries[i].s_goal is not None:
+                for t in self.time_steps:
+                    if self.batteries[i].s_goal[t] > 0:
+                        sc.variables['s_goal_pen'][i][t] = pulp.LpVariable(f"s_goal_pen_{i}_{t}{sc.suffix}", lowBound=0)
+
+        # penalty variable for not being able to charge with the required power
+        sc.variables['p_demand_pen'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
+        # binary variable to allow one out of two alternative constraints
+        sc.variables['z_p_demand'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
+        # binary variable to capture when s_max is reached
+        sc.variables['z_s_max_reached'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
+        for i, bat in enumerate(self.batteries):
+            if bat.p_demand is not None:
+                for t in self.time_steps:
+                    sc.variables['p_demand_pen'][i][t] = pulp.LpVariable(f"p_demand_pen_{i}_{t}{sc.suffix}", lowBound=0)
+                    sc.variables['z_p_demand'][i][t] = pulp.LpVariable(f"z_p_demand_{i}_{t}{sc.suffix}", cat='Binary')
+                    sc.variables['z_s_max_reached'][i][t] = pulp.LpVariable(f"z_s_max_reached_{i}_{t}{sc.suffix}", cat='Binary')
+
+        # penalty variable for staying above max SOC and below min SOC
+        sc.variables['s_max_pen'] = [[pulp.LpVariable(f"s_max_pen_{i}_{t}{sc.suffix}", lowBound=0)
+                                      for t in self.time_steps] for i in range(len(self.batteries))]
+        sc.variables['s_min_pen'] = [[pulp.LpVariable(f"s_min_pen_{i}_{t}{sc.suffix}", lowBound=0)
+                                      for t in self.time_steps] for i in range(len(self.batteries))]
+
+        # Grid import/export variables [Wh]
+        sc.variables['n'] = [pulp.LpVariable(f"n_{t}{sc.suffix}", lowBound=0) for t in self.time_steps]
+        sc.variables['e'] = [pulp.LpVariable(f"e_{t}{sc.suffix}", lowBound=0) for t in self.time_steps]
+
+        # penalty variables for exceeding grid power limits (W)
+        # for grid import
+        if self.grid.p_max_imp is not None:
+            sc.variables['e_imp_lim_exc'] = [pulp.LpVariable(f"p_imp_pen_{t}{sc.suffix}", lowBound=0) for t in self.time_steps]
+            # binary variable to allow limit exceeding only if the regular import actually hits the limit
+            # this is required to avoid that limit exceeds are shifted to other time steps
+            sc.variables['z_imp_lim'] = [pulp.LpVariable(f"z_imp_lim_{t}{sc.suffix}", cat='Binary') for t in self.time_steps]
+
+        # for grid export
+        if self.grid.p_max_exp is not None:
+            sc.variables['e_exp_lim_exc'] = [pulp.LpVariable(f"e_exp_lim_exc_{t}{sc.suffix}", lowBound=0) for t in self.time_steps]
+            # binary variable to allow limit exceeding only if the regular export actually hits the limit
+            sc.variables['z_exp_lim'] = [pulp.LpVariable(f"z_exp_lim_{t}{sc.suffix}", cat='Binary') for t in self.time_steps]
+
         # Binary variable: power flow direction to / from grid variables
         # these variables
         # 1. avoid direct export from import if export remuneration is greater than import cost
         # 2. control grid charging to batteries and grid export from batteries acc. to configuration
-        self.variables['y'] = []
+        sc.variables['y'] = []
         for t in self.time_steps:
-            self.variables['y'].append(pulp.LpVariable(f"y_{t}", cat='Binary'))
+            sc.variables['y'].append(pulp.LpVariable(f"y_{t}{sc.suffix}", cat='Binary'))
 
         # Binary variable for charging activation
-        self.variables['z_c'] = {}
+        sc.variables['z_c'] = {}
         for i, bat in enumerate(self.batteries):
             if bat.c_min > 0:
-                self.variables['z_c'][i] = [
-                    pulp.LpVariable(f"z_c_{i}_{t}", cat='Binary')
+                sc.variables['z_c'][i] = [
+                    pulp.LpVariable(f"z_c_{i}_{t}{sc.suffix}", cat='Binary')
                     for t in self.time_steps
                 ]
             else:
-                self.variables['z_c'][i] = None
+                sc.variables['z_c'][i] = None
 
         # Binary variable to lock charging against discharging
-        self.variables['z_cd'] = {}
+        sc.variables['z_cd'] = {}
         for i, bat in enumerate(self.batteries):
-            self.variables['z_cd'][i] = [
-                pulp.LpVariable(f"z_cd_{i}_{t}", cat='Binary')
+            sc.variables['z_cd'][i] = [
+                pulp.LpVariable(f"z_cd_{i}_{t}{sc.suffix}", cat='Binary')
                 for t in self.time_steps
             ]
 
     def _setup_target_function(self):
         """
         Gather all target function contributions and instantiate the objective
+        """
+
+        # expected cost and expected preferences over the PV scenarios. The weights sum to 1, so a
+        # term on a scenario independent variable keeps the coefficient it had and the single
+        # scenario model is the one it was before scenarios existed.
+        objective = sum(sc.weight * self._scenario_cost(sc) for sc in self.scenarios)
+        # the preferences carry the same weights. Weighting the cost alone would leave the tie
+        # break stage deciding as if the scenarios were equally likely.
+        preference = sum(sc.weight * self._scenario_preferences(sc) for sc in self.scenarios)
+
+        # the cost part is real money. It is kept separate from the preference terms because
+        # solve() optimizes the two in sequence, see _solve_preferences().
+        self.cost_objective = objective
+        self.preference_objective = preference
+
+        # the objective a single solve would work on. solve() replaces it per stage and puts it
+        # back afterwards, so pulp.value(problem.objective) always reads the total worth of the
+        # solution no matter how it was reached. The scale is derived from this combined objective
+        # and reused by both stages, so the two stay comparable and the absolute gap keeps its
+        # meaning across them.
+        self.objective_scale = objective_scale(objective + preference)
+        self.problem += (objective + preference) * self.objective_scale
+
+    def _scenario_cost(self, sc: PvScenario):
+        """
+        Real money of one PV scenario: grid cost, export revenue, battery value, demand rate and
+        the penalties. Scenario independent variables appear here as well, weighted to 1 in total
+        over the scenarios.
         """
 
         # Objective function (1): Maximize economic benefit
@@ -381,21 +491,21 @@ class Optimizer:
             if self.grid.p_max_imp is not None:
                 objective -= (
                     # grid import up to the demand rate threshold
-                    self.variables['n'][t]
+                    sc.variables['n'][t]
                     # import beyond the threshold
-                    + self.variables['e_imp_lim_exc'][t]
+                    + sc.variables['e_imp_lim_exc'][t]
                 ) * self.time_series.p_N[t]
             else:
                 # standard case
-                objective -= self.variables['n'][t] * self.time_series.p_N[t]
+                objective -= sc.variables['n'][t] * self.time_series.p_N[t]
 
         # Grid export revenue [currency unit]
         for t in self.time_steps:
-            objective += self.variables['e'][t] * self.time_series.p_E[t]
+            objective += sc.variables['e'][t] * self.time_series.p_E[t]
 
         # Final state of charge value [currency unit]
         for i, bat in enumerate(self.batteries):
-            objective += self.variables['s'][i][-1] * bat.p_a
+            objective += sc.variables['s'][i][-1] * bat.p_a
 
         # charge for import power demand rate. The demand rate is applied to the maximum
         # power draw beyond the threshold within the time horizon.
@@ -406,7 +516,7 @@ class Optimizer:
         # Penalties for exceeding battery SOC limits at start
         for i, bat in enumerate(self.batteries):
             for t in self.time_steps:
-                objective += - self.prc_soc_exc_pen * (self.variables['s_max_pen'][i][t] + self.variables['s_min_pen'][i][t])
+                objective += - self.prc_soc_exc_pen * (sc.variables['s_max_pen'][i][t] + sc.variables['s_min_pen'][i][t])
 
         ############################################################################
         # Penalties for goals that cannot be met
@@ -416,12 +526,12 @@ class Optimizer:
                 for t in self.time_steps:
                     if self.batteries[i].s_goal[t] > 0:
                         # negative target function contribution in a maximizing optimization
-                        objective += - self.prc_e_goal_pen * self.variables['s_goal_pen'][i][t]
+                        objective += - self.prc_e_goal_pen * sc.variables['s_goal_pen'][i][t]
             # unmet charging demand due to battery reaching maximum SOC with incentive to do charging early
             if bat.p_demand is not None:
                 for t in self.time_steps:
                     objective += - self.prc_p_goal_pen \
-                        * self.variables['p_demand_pen'][i][t] \
+                        * sc.variables['p_demand_pen'][i][t] \
                         * (1 + (self.T - t)/self.T)
 
         # penalties for grid power limits that cannot be met.
@@ -430,17 +540,20 @@ class Optimizer:
             # penalty for exceeding the given import limit
             if self.grid.p_max_imp is not None and not self.is_grid_demand_rate_active:
                 # negative target function contribution in a maximizing optimization
-                objective += - self.prc_e_grid_imp_pen * self.variables['e_imp_lim_exc'][t]
+                objective += - self.prc_e_grid_imp_pen * sc.variables['e_imp_lim_exc'][t]
 
             # penalty for exceeding the grid export limit
             if self.grid.p_max_exp is not None:
                 # negative target function contribution in a maximizing optimization
                 # decrease penalty slightly over time to push limit exceeding to late times
-                objective += - self.prc_e_grid_exp_pen * (1.0 - t * 1e-5) * self.variables['e_exp_lim_exc'][t]
+                objective += - self.prc_e_grid_exp_pen * (1.0 - t * 1e-5) * sc.variables['e_exp_lim_exc'][t]
 
-        # everything above is real money. It is kept separate from the preference terms below
-        # because solve() optimizes the two in sequence, see _solve_preferences().
-        self.cost_objective = objective
+        return objective
+
+    def _scenario_preferences(self, sc: PvScenario):
+        """
+        Cost neutral tie breakers of one PV scenario
+        """
 
         #############################################################################
         # Secondary strategies to implement preferences without impact to actual cost
@@ -450,7 +563,7 @@ class Optimizer:
         if self.strategy.charging_strategy == 'charge_before_export':
             for i, bat in enumerate(self.batteries):
                 for t in self.time_steps:
-                    preference += - self.variables['e'][t] * self.min_import_price * 2e-5 * (self.T - t)
+                    preference += - sc.variables['e'][t] * self.min_import_price * 2e-5 * (self.T - t)
 
         # level the grid profile to unload the public grid from peaks. attenuate_demand_peaks levels
         # grid import, attenuate_feedin_peaks levels grid export, attenuate_grid_peaks levels both.
@@ -466,25 +579,17 @@ class Optimizer:
         if self.strategy.discharging_strategy == 'discharge_before_import':
             for i, bat in enumerate(self.batteries):
                 for t in self.time_steps:
-                    preference += - self.variables['n'][t] * self.min_import_price * 5e-6 * (self.T - t)
+                    preference += - sc.variables['n'][t] * self.min_import_price * 5e-6 * (self.T - t)
 
         # charging and discharging priorities
         for i, bat in enumerate(self.batteries):
             for t in self.time_steps:
-                preference += self.variables['c'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
-                preference += self.variables['d'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
+                preference += sc.variables['c'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
+                preference += sc.variables['d'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
 
-        self.preference_objective = preference
+        return preference
 
-        # the objective a single solve would work on. solve() replaces it per stage and puts it
-        # back afterwards, so pulp.value(problem.objective) always reads the total worth of the
-        # solution no matter how it was reached. The scale is derived from this combined objective
-        # and reused by both stages, so the two stay comparable and the absolute gap keeps its
-        # meaning across them.
-        self.objective_scale = objective_scale(objective + preference)
-        self.problem += (objective + preference) * self.objective_scale
-
-    def _add_energy_balance_constraints(self):
+    def _add_energy_balance_constraints(self, sc: PvScenario):
         """
         Add constraints related to the energy balance to the model.
         """
@@ -499,29 +604,29 @@ class Optimizer:
             # battery charge + discharge balance
             battery_net_discharge = 0
             for i, bat in enumerate(self.batteries):
-                battery_net_discharge += (- self.variables['c'][i][t]
-                                          + self.variables['d'][i][t])
+                battery_net_discharge += (- sc.variables['c'][i][t]
+                                          + sc.variables['d'][i][t])
 
             # grid import: if there is an import power limit, the power exceeding the limit
             # is going to the penalty variable. If a demand rate is active, it is applied
             # to power drawn beyond the p_max_imp threshold.
-            e_grid_imp = self.variables['n'][t]
+            e_grid_imp = sc.variables['n'][t]
             if self.grid.p_max_imp is not None:
                 if self.is_grid_demand_rate_active:
                     # demand rate calculation
-                    e_grid_imp = self.variables['n'][t]+self.variables['e_imp_lim_exc'][t]
+                    e_grid_imp = sc.variables['n'][t]+sc.variables['e_imp_lim_exc'][t]
                 else:
                     # grid import power limit
-                    e_grid_imp = self.variables['n'][t]+self.variables['e_imp_lim_exc'][t]
+                    e_grid_imp = sc.variables['n'][t]+sc.variables['e_imp_lim_exc'][t]
 
             # grid export: if there is a limit, the power exceeding the limit
             # is going to the penalty variable
-            e_grid_exp = self.variables['e'][t]
+            e_grid_exp = sc.variables['e'][t]
             if self.grid.p_max_exp is not None:
-                e_grid_exp = self.variables['e'][t]+self.variables['e_exp_lim_exc'][t]
+                e_grid_exp = sc.variables['e'][t]+sc.variables['e_exp_lim_exc'][t]
 
             self.problem += (battery_net_discharge
-                             + self.time_series.ft[t]
+                             + sc.ft[t]
                              + e_grid_imp
                              == e_grid_exp
                              + self.time_series.gt[t])
@@ -536,43 +641,43 @@ class Optimizer:
         cap_c_imp = sum(b.c_max for b in self.batteries if b.charge_from_grid)
         for t in self.time_steps:
             dth = self.time_series.dt[t] / 3600.
-            m_exp = self.time_series.ft[t] + cap_d_exp * dth if self.grid.p_max_imp is None else self.M
+            m_exp = sc.ft[t] + cap_d_exp * dth if self.grid.p_max_imp is None else self.M
             m_imp = self.time_series.gt[t] + cap_c_imp * dth if self.grid.p_max_exp is None else self.M
             # Export constraint
-            self.problem += self.variables['e'][t] <= m_exp * self.variables['y'][t]
+            self.problem += sc.variables['e'][t] <= m_exp * sc.variables['y'][t]
             # Import constraint
-            self.problem += self.variables['n'][t] <= m_imp * (1 - self.variables['y'][t])
+            self.problem += sc.variables['n'][t] <= m_imp * (1 - sc.variables['y'][t])
 
         # limit regular grid import power
         if self.grid.p_max_imp is not None:
             if self.is_grid_demand_rate_active:
                 # limit the demand rate free portion of the power
                 for t in self.time_steps:
-                    self.problem += self.variables['n'][t] <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
-                    self.problem += (self.grid.p_max_imp * self.time_series.dt[t] / 3600 - self.variables['n'][t]
+                    self.problem += sc.variables['n'][t] <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
+                    self.problem += (self.grid.p_max_imp * self.time_series.dt[t] / 3600 - sc.variables['n'][t]
                                      <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
-                                     * self.variables['z_imp_lim'][t])
-                    self.problem += (self.variables['e_imp_lim_exc'][t]
-                                     <= self.M * (1 - self.variables['z_imp_lim'][t]))
+                                     * sc.variables['z_imp_lim'][t])
+                    self.problem += (sc.variables['e_imp_lim_exc'][t]
+                                     <= self.M * (1 - sc.variables['z_imp_lim'][t]))
             else:
                 # limit the actual import power
                 for t in self.time_steps:
-                    self.problem += self.variables['n'][t] <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
-                    self.problem += (self.grid.p_max_imp * self.time_series.dt[t] / 3600 - self.variables['n'][t]
+                    self.problem += sc.variables['n'][t] <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
+                    self.problem += (self.grid.p_max_imp * self.time_series.dt[t] / 3600 - sc.variables['n'][t]
                                      <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
-                                     * self.variables['z_imp_lim'][t])
-                    self.problem += (self.variables['e_imp_lim_exc'][t]
-                                     <= self.M * (1 - self.variables['z_imp_lim'][t]))
+                                     * sc.variables['z_imp_lim'][t])
+                    self.problem += (sc.variables['e_imp_lim_exc'][t]
+                                     <= self.M * (1 - sc.variables['z_imp_lim'][t]))
 
         # limit regular grid export power
         if self.grid.p_max_exp is not None:
             for t in self.time_steps:
-                self.problem += self.variables['e'][t] <= self.grid.p_max_exp * self.time_series.dt[t] / 3600
-                self.problem += (self.grid.p_max_exp * self.time_series.dt[t] / 3600 - self.variables['e'][t]
+                self.problem += sc.variables['e'][t] <= self.grid.p_max_exp * self.time_series.dt[t] / 3600
+                self.problem += (self.grid.p_max_exp * self.time_series.dt[t] / 3600 - sc.variables['e'][t]
                                  <= self.grid.p_max_exp * self.time_series.dt[t] / 3600
-                                 * self.variables['z_exp_lim'][t])
-                self.problem += (self.variables['e_exp_lim_exc'][t]
-                                 <= self.M * (1 - self.variables['z_exp_lim'][t]))
+                                 * sc.variables['z_exp_lim'][t])
+                self.problem += (sc.variables['e_exp_lim_exc'][t]
+                                 <= self.M * (1 - sc.variables['z_exp_lim'][t]))
 
         # track the horizon maximum of the total grid power for every side the strategy levels. It
         # includes the portion beyond p_max_imp / p_max_exp, so it stays correct in demand rate mode
@@ -587,9 +692,9 @@ class Optimizer:
             # total grid power of this side per time step (W)
             p_grid = []
             for t in self.time_steps:
-                e_grid = self.variables[grid_var][t]
+                e_grid = sc.variables[grid_var][t]
                 if lim_exc_var in self.variables:
-                    e_grid = e_grid + self.variables[lim_exc_var][t]
+                    e_grid = e_grid + sc.variables[lim_exc_var][t]
                 p_grid.append(e_grid * 3600 / self.time_series.dt[t])
 
             for t in self.time_steps:
@@ -599,10 +704,10 @@ class Optimizer:
         # of all time steps drives the demand rate charge
         if self.is_grid_demand_rate_active:
             for t in self.time_steps:
-                self.problem += self.variables['e_imp_lim_exc'][t] \
+                self.problem += sc.variables['e_imp_lim_exc'][t] \
                     <= self.variables['p_max_imp_exc'] * self.time_series.dt[t] / 3600
 
-    def _add_battery_constraints(self):
+    def _add_battery_constraints(self, sc: PvScenario):
         """
         Add constraints related to battery behavior to the model.
         """
@@ -611,31 +716,31 @@ class Optimizer:
         # SOC is reached or max. charing will be forced until min SOC is reached.
         for i, bat in enumerate(self.batteries):
             for t in range(0, self.T):
-                self.problem += (self.variables['s_max_pen'][i][t] >= self.variables['s'][i][t] - bat.s_max)
-                self.problem += (self.variables['s_min_pen'][i][t] >= bat.s_min - self.variables['s'][i][t])
+                self.problem += (sc.variables['s_max_pen'][i][t] >= sc.variables['s'][i][t] - bat.s_max)
+                self.problem += (sc.variables['s_min_pen'][i][t] >= bat.s_min - sc.variables['s'][i][t])
 
         # Constraint (3): Battery dynamics
         for i, bat in enumerate(self.batteries):
             # Initial state of charge
             if len(self.time_steps) > 0:
-                self.problem += (self.variables['s'][i][0]
+                self.problem += (sc.variables['s'][i][0]
                                  == bat.s_initial
-                                 + self.eta_c * self.variables['c'][i][0]
-                                 - (1 / self.eta_d) * self.variables['d'][i][0])
+                                 + self.eta_c * sc.variables['c'][i][0]
+                                 - (1 / self.eta_d) * sc.variables['d'][i][0])
 
             # State of charge evolution
             for t in range(1, self.T):
-                self.problem += (self.variables['s'][i][t]
-                                 == self.variables['s'][i][t - 1]
-                                 + self.eta_c * self.variables['c'][i][t]
-                                 - (1 / self.eta_d) * self.variables['d'][i][t])
+                self.problem += (sc.variables['s'][i][t]
+                                 == sc.variables['s'][i][t - 1]
+                                 + self.eta_c * sc.variables['c'][i][t]
+                                 - (1 / self.eta_d) * sc.variables['d'][i][t])
 
             # Constraint (6): Battery SOC goal constraints (for t > 0)
             if bat.s_goal is not None:
                 for t in range(1, self.T):
                     if bat.s_goal[t] > 0:
-                        self.problem += (self.variables['s'][i][t]
-                                         + self.variables['s_goal_pen'][i][t] >= bat.s_goal[t])
+                        self.problem += (sc.variables['s'][i][t]
+                                         + sc.variables['s_goal_pen'][i][t] >= bat.s_goal[t])
 
             # Constraint: Minimum battery charge demand (for t > 0)
             if bat.p_demand is not None:
@@ -647,59 +752,89 @@ class Optimizer:
                         # introduce z_p_demand to become only 1 if s_max is almost reached and the
                         # charging with c_min would stop before the end of the time slot
                         # s is bounded below by 0, so s_max is the largest the left side can get
-                        self.problem += ((bat.s_max - self.variables['s'][i][t])
-                                         <= (1 - self.variables['z_p_demand'][i][t]) * bat.s_max
+                        self.problem += ((bat.s_max - sc.variables['s'][i][t])
+                                         <= (1 - sc.variables['z_p_demand'][i][t]) * bat.s_max
                                          + bat.c_min * self.time_series.dt[t] / 3600.)
 
                         # introduce z_s_max_reached to become only 1 if s_max is fully reached
-                        self.problem += ((bat.s_max - self.variables['s'][i][t])
-                                         <= (1 - self.variables['z_s_max_reached'][i][t]) * bat.s_max)
+                        self.problem += ((bat.s_max - sc.variables['s'][i][t])
+                                         <= (1 - sc.variables['z_s_max_reached'][i][t]) * bat.s_max)
 
                         # set a "soft" constraint to reach the requested charging rate if possible.
                         # deactivate it if s_max is already reached
-                        self.problem += (self.variables['c'][i][t] + self.variables['p_demand_pen'][i][t]
-                                         >= (1 - self.variables['z_s_max_reached'][i][t]) * p_demand)
+                        self.problem += (sc.variables['c'][i][t] + sc.variables['p_demand_pen'][i][t]
+                                         >= (1 - sc.variables['z_s_max_reached'][i][t]) * p_demand)
                     else:
                         # if there is no p_demand set, make sure z_p_demand is 0 to keep the below c_min constraint effective
-                        self.problem += (self.variables['z_p_demand'][i][t] <= 0)
+                        self.problem += (sc.variables['z_p_demand'][i][t] <= 0)
 
                     if bat.c_min > 0:
                         # set constraints to exclude charging between 0 and c_min if z_p_demand is not 1.
-                        self.problem += (self.variables['c'][i][t]
-                                         + bat.c_min * self.time_series.dt[t] / 3600. * self.variables['z_p_demand'][i][t]
-                                         >= bat.c_min * self.time_series.dt[t] / 3600. * self.variables['z_c'][i][t])
-                        self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
-                                         * self.variables['z_c'][i][t])
+                        self.problem += (sc.variables['c'][i][t]
+                                         + bat.c_min * self.time_series.dt[t] / 3600. * sc.variables['z_p_demand'][i][t]
+                                         >= bat.c_min * self.time_series.dt[t] / 3600. * sc.variables['z_c'][i][t])
+                        self.problem += (sc.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                         * sc.variables['z_c'][i][t])
 
             # Constraint (7): Minimum charge power limits if there is no charge demand
             elif bat.c_min > 0:
                 for t in self.time_steps:
                     # Lower bound: either 0 or at least c_min
-                    self.problem += (self.variables['c'][i][t] >= bat.c_min * self.time_series.dt[t] / 3600.
-                                     * self.variables['z_c'][i][t])
-                    self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
-                                     * self.variables['z_c'][i][t])
+                    self.problem += (sc.variables['c'][i][t] >= bat.c_min * self.time_series.dt[t] / 3600.
+                                     * sc.variables['z_c'][i][t])
+                    self.problem += (sc.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                     * sc.variables['z_c'][i][t])
 
             # control battery charging from grid
             if not bat.charge_from_grid:
                 for t in self.time_steps:
-                    self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
-                                     * self.variables['y'][t])
+                    self.problem += (sc.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                     * sc.variables['y'][t])
 
             # control battery discharging to grid
             if not bat.discharge_to_grid:
                 for t in self.time_steps:
-                    self.problem += (self.variables['d'][i][t] <= bat.d_max * self.time_series.dt[t] / 3600.
-                                     * (1 - self.variables['y'][t]))
+                    self.problem += (sc.variables['d'][i][t] <= bat.d_max * self.time_series.dt[t] / 3600.
+                                     * (1 - sc.variables['y'][t]))
 
             # lock charging against discharging
             for t in self.time_steps:
                 # Discharge constraint
-                self.problem += (self.variables['d'][i][t] <= bat.d_max * self.time_series.dt[t] / 3600.
-                                 * self.variables['z_cd'][i][t])
+                self.problem += (sc.variables['d'][i][t] <= bat.d_max * self.time_series.dt[t] / 3600.
+                                 * sc.variables['z_cd'][i][t])
                 # Charge constraint
-                self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
-                                 * (1 - self.variables['z_cd'][i][t]))
+                self.problem += (sc.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                 * (1 - sc.variables['z_cd'][i][t]))
+
+    def _add_non_anticipativity_constraints(self):
+        """
+        Non anticipativity: the scenarios may go their own way from the second time step on, but
+        the first one is decided now, before the yield is known, so it is one decision and every
+        scenario carries the same values for it.
+
+        The first time step is the reason its yield is left unscaled in _build_scenarios. All the
+        constraints it takes part in are then identical across the scenarios, so tying the
+        variables removes no solution, it only keeps the solver from reporting three different
+        decisions for the step the caller is about to act on. The penalty variables are left out:
+        they are bounded by the variables tied here and pushed to that bound by the objective, so
+        they come out equal on their own.
+        """
+        if len(self.scenarios) < 2 or self.T == 0:
+            return
+
+        grid = [key for key in ('n', 'e', 'y', 'e_imp_lim_exc', 'z_imp_lim', 'e_exp_lim_exc', 'z_exp_lim')
+                if key in self.scenarios[0].variables]
+        battery = ('c', 'd', 's', 'z_c', 'z_cd', 'z_p_demand', 'z_s_max_reached')
+
+        reference = self.scenarios[0]
+        for sc in self.scenarios[1:]:
+            for key in grid:
+                self.problem += sc.variables[key][0] == reference.variables[key][0]
+            for key in battery:
+                for i in range(len(self.batteries)):
+                    # not every battery has every gate, c_min and p_demand decide which
+                    if sc.variables[key][i] is not None and sc.variables[key][i][0] is not None:
+                        self.problem += sc.variables[key][i][0] == reference.variables[key][i][0]
 
     def _solver(self, tmpdir, **options):
         """CBC with the shared settings, writing its scratch files to tmpdir."""
@@ -874,6 +1009,12 @@ class Optimizer:
 
         # Extract results.
         #
+        # One trajectory out of the scenarios: the first time step is the decision, shared by all
+        # of them, and the rest is the schedule of the expected scenario. That part is a plan to
+        # show, not a commitment, the schedule actually taken from the next time step on is the one
+        # of whatever yield turns up. The limit violations and the objective value are read off the
+        # same scenario, so the reported numbers describe the reported schedule.
+        #
         # pulp reports LpStatusOptimal whenever CBC came back with any feasible solution, including
         # one it stopped on at the time limit, so status alone cannot tell a proved schedule from a
         # truncated one. Measured on a captured request, a 2 s run and a 30 s run both said Optimal
@@ -895,26 +1036,26 @@ class Optimizer:
         # grid import and export if no demand rate is active
         # if a limit is set and exceeded, this is the part that is actually imported / exported.
         # the exceeding portion is captured in 'e_imp_lim_exc' and / or 'e_exp_lim_exc'
-        e_grid_import = [pulp.value(var) for var in self.variables['n']]
-        e_grid_export = [pulp.value(var) for var in self.variables['e']]
+        e_grid_import = [pulp.value(var) for var in self.reported_scenario.variables['n']]
+        e_grid_export = [pulp.value(var) for var in self.reported_scenario.variables['e']]
         # if a demand rate is active, the actual import power is both parts, 'n' and 'e_imp_lim_exc'
         if self.is_grid_demand_rate_active:
             for t in self.time_steps:
-                e_grid_import[t] += pulp.value(self.variables['e_imp_lim_exc'][t])
+                e_grid_import[t] += pulp.value(self.reported_scenario.variables['e_imp_lim_exc'][t])
 
         # get limit violations
         # grid import limit
         grid_imp_limit_violated = False
         e_grid_imp_overshoot = []
         if self.grid.p_max_imp is not None:
-            grid_imp_limit_violated = (np.max([pulp.value(var) for var in self.variables['e_imp_lim_exc']]) > 0)
-            e_grid_imp_overshoot = [pulp.value(var) for var in self.variables['e_imp_lim_exc']]
+            grid_imp_limit_violated = (np.max([pulp.value(var) for var in self.reported_scenario.variables['e_imp_lim_exc']]) > 0)
+            e_grid_imp_overshoot = [pulp.value(var) for var in self.reported_scenario.variables['e_imp_lim_exc']]
         # grid export limit
         grid_exp_limit_hit = False
         e_grid_exp_overshoot = []
         if self.grid.p_max_exp is not None:
-            grid_exp_limit_hit = (np.max([pulp.value(var) for var in self.variables['e_exp_lim_exc']]) > 0)
-            e_grid_exp_overshoot = [pulp.value(var) for var in self.variables['e_exp_lim_exc']]
+            grid_exp_limit_hit = (np.max([pulp.value(var) for var in self.reported_scenario.variables['e_exp_lim_exc']]) > 0)
+            e_grid_exp_overshoot = [pulp.value(var) for var in self.reported_scenario.variables['e_exp_lim_exc']]
 
         # a Feasible solve carries a full schedule, it just is not proved, so it is returned like
         # an optimal one. Only the label changes.
@@ -937,14 +1078,14 @@ class Optimizer:
             # Extract battery results
             for i, bat in enumerate(self.batteries):
                 battery_result = {
-                    'charging_power': [pulp.value(var) for var in self.variables['c'][i]],
-                    'discharging_power': [pulp.value(var) for var in self.variables['d'][i]],
-                    'state_of_charge': [pulp.value(var) for var in self.variables['s'][i]]
+                    'charging_power': [pulp.value(var) for var in self.reported_scenario.variables['c'][i]],
+                    'discharging_power': [pulp.value(var) for var in self.reported_scenario.variables['d'][i]],
+                    'state_of_charge': [pulp.value(var) for var in self.reported_scenario.variables['s'][i]]
                 }
                 result['batteries'].append(battery_result)
 
             # Extract flow direction
-            for y_var in self.variables['y']:
+            for y_var in self.reported_scenario.variables['y']:
                 if y_var is not None:
                     result['flow_direction'].append(int(pulp.value(y_var)))
                 else:
@@ -977,23 +1118,23 @@ class Optimizer:
             if self.grid.p_max_imp is not None:
                 clean_objective -= (
                     # grid import up to the demand rate threshold
-                    pulp.value(self.variables['n'][t])
+                    pulp.value(self.reported_scenario.variables['n'][t])
                     # import beyond the threshold
-                    + pulp.value(self.variables['e_imp_lim_exc'][t])
+                    + pulp.value(self.reported_scenario.variables['e_imp_lim_exc'][t])
                 ) * self.time_series.p_N[t]
             else:
                 # standard case
-                clean_objective -= pulp.value(self.variables['n'][t]) * self.time_series.p_N[t]
+                clean_objective -= pulp.value(self.reported_scenario.variables['n'][t]) * self.time_series.p_N[t]
 
         # Grid export revenue [currency unit]
         for t in self.time_steps:
-            clean_objective += pulp.value(self.variables['e'][t]) * self.time_series.p_E[t]
+            clean_objective += pulp.value(self.reported_scenario.variables['e'][t]) * self.time_series.p_E[t]
 
         # Value of the energy the horizon added to the batteries [currency unit]. The reference is
         # bat.s_initial and not s[0]: s[0] is the state after the first time step and already
         # carries that step's charging, so subtracting it dropped the first step from the result.
         for i, bat in enumerate(self.batteries):
-            clean_objective += (pulp.value(self.variables['s'][i][self.T-1])
+            clean_objective += (pulp.value(self.reported_scenario.variables['s'][i][self.T-1])
                                 - bat.s_initial) * bat.p_a
 
         # charge for import power demand rate. The demand rate is applied to the maximum

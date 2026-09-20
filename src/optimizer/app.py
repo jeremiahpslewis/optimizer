@@ -134,6 +134,17 @@ optimization_input_model = api.model('OptimizationInput', {
     'time_series': fields.Nested(time_series_model, required=True, description='Time series data'),
     'eta_c': fields.Float(required=False, default=0.95, description='Charging efficiency'),
     'eta_d': fields.Float(required=False, default=0.95, description='Discharging efficiency'),
+    'pv_spread': fields.Float(required=False, default=0.0, min=0, max=1,
+                              description='Relative spread of the solar forecast the schedule is planned over. The forecast is taken as three '
+                                          'scenarios, scaled by 1 - pv_spread, 1 and 1 + pv_spread, and the schedule minimizes the expected '
+                                          'cost over them. 0 plans over the forecast alone.'),
+    'pv_scenario_weights': fields.List(fields.Float, required=False,
+                                       description='Probability of the low yield, the expected and the high yield solar scenario. Normalized '
+                                                   'before use, defaults to [0.1, 0.8, 0.1]. Only read when pv_spread is set.'),
+    'prc_e_goal_pen': fields.Float(required=False, min=0,
+                                   description='Price per Wh of charge goal that cannot be reached (currency units/Wh). Defaults to a hundred '
+                                               'times the largest real rate of the request, which reaches the goal at any price. A realistic '
+                                               'value is one to a few times the import price.'),
 })
 
 # Output models
@@ -235,6 +246,19 @@ class OptimizeCharging(Resource):
             if len(set(lengths)) > 1:
                 api.abort(400, "All time series must have the same length")
 
+            # solar scenarios. A spread of 1 empties the low yield scenario, beyond that its
+            # forecast would turn negative
+            pv_spread = data.get('pv_spread', 0.0)
+            if not 0 <= pv_spread <= 1:
+                api.abort(400, "pv_spread must be between 0 and 1")
+
+            pv_scenario_weights = data.get('pv_scenario_weights')
+            if pv_scenario_weights is not None:
+                if len(pv_scenario_weights) != 3:
+                    api.abort(400, "pv_scenario_weights takes one weight per scenario, three in total")
+                if min(pv_scenario_weights) < 0 or sum(pv_scenario_weights) <= 0:
+                    api.abort(400, "pv_scenario_weights must be non negative and sum to more than zero")
+
         except Exception as e:
             api.abort(400, f"Invalid data format: {str(e)}")
 
@@ -247,7 +271,10 @@ class OptimizeCharging(Resource):
                 time_series=time_series,
                 eta_c=data.get('eta_c', 0.95),
                 eta_d=data.get('eta_d', 0.95),
-                M=1e6
+                M=1e6,
+                pv_spread=pv_spread,
+                pv_scenario_weights=pv_scenario_weights,
+                prc_e_goal_pen=data.get('prc_e_goal_pen'),
             )
 
             started = time.perf_counter()

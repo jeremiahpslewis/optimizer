@@ -353,6 +353,37 @@ components:
           default: 0.95
           description: Discharging efficiency (0 to 1)
           example: 0.95
+        pv_spread:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: >-
+            Relative spread of the solar forecast the schedule is planned over. The forecast is taken as three
+            scenarios, scaled by 1 - pv_spread, 1 and 1 + pv_spread, and the schedule minimizes the expected cost
+            over them. The first time step keeps the forecast unscaled, it is the step being decided rather than
+            planned. 0 plans over the forecast alone.
+          example: 0.3
+        pv_scenario_weights:
+          type: array
+          items:
+            type: number
+            minimum: 0
+          minItems: 3
+          maxItems: 3
+          description: >-
+            Probability of the low yield, the expected and the high yield solar scenario. Normalized before use.
+            Only read when pv_spread is set.
+          example: [0.1, 0.8, 0.1]
+        prc_e_goal_pen:
+          type: number
+          minimum: 0
+          description: >-
+            Price per Wh of charge goal that cannot be reached (currency units/Wh). Defaults to a hundred times
+            the largest real rate of the request, which reaches the goal at any price it can be reached at. A
+            realistic value is one to a few times the import price, and it only makes a difference once the
+            schedule plans over scenarios a goal is out of reach in.
+          example: 0.0006
 
     BatteryResult:
       type: object

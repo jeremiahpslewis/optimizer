@@ -146,8 +146,17 @@ type OptimizationInput struct {
 	EtaC float32 `json:"eta_c,omitempty"`
 
 	// EtaD Discharging efficiency (0 to 1)
-	EtaD       float32           `json:"eta_d,omitempty"`
-	Grid       GridConfig        `json:"grid,omitempty"`
+	EtaD float32    `json:"eta_d,omitempty"`
+	Grid GridConfig `json:"grid,omitempty"`
+
+	// PrcEGoalPen Price per Wh of charge goal that cannot be reached (currency units/Wh). Defaults to a hundred times the largest real rate of the request, which reaches the goal at any price it can be reached at. A realistic value is one to a few times the import price, and it only makes a difference once the schedule plans over scenarios a goal is out of reach in.
+	PrcEGoalPen float32 `json:"prc_e_goal_pen,omitempty"`
+
+	// PvScenarioWeights Probability of the low yield, the expected and the high yield solar scenario. Normalized before use. Only read when pv_spread is set.
+	PvScenarioWeights []float32 `json:"pv_scenario_weights,omitempty"`
+
+	// PvSpread Relative spread of the solar forecast the schedule is planned over. The forecast is taken as three scenarios, scaled by 1 - pv_spread, 1 and 1 + pv_spread, and the schedule minimizes the expected cost over them. The first time step keeps the forecast unscaled, it is the step being decided rather than planned. 0 plans over the forecast alone.
+	PvSpread   float32           `json:"pv_spread,omitempty"`
 	Strategy   OptimizerStrategy `json:"strategy,omitempty"`
 	TimeSeries TimeSeries        `json:"time_series"`
 }

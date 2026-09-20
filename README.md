@@ -16,6 +16,7 @@ Inspired by https://github.com/Akkudoktor-EOS/EOS/pull/462
 - **Honours grid limits** for import and export power, and supports a demand rate charged on the highest power drawn beyond a threshold.
 - **Never returns "infeasible" for a goal it cannot reach.** Goals, minimum charge demand and grid limits are soft constraints backed by penalties, so an over-constrained request still yields the best achievable schedule plus a flag telling you which limit was violated.
 - **Optional strategies** break ties that cost nothing: charge before exporting, discharge before importing, or level grid peaks on the import side, the feed-in side, or both.
+- **Optionally plans against an uncertain PV forecast** instead of taking it at face value, with `pv_spread`.
 
 ## Example
 
@@ -45,6 +46,16 @@ The maximum is a single value out of the horizon, which leaves one gap: a load s
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/example-peak-dark.svg">
   <img alt="Grid exchange over 24 hours without a strategy and with attenuate_grid_peaks, showing the import peak dropping from 11.5 kW to 3.6 kW" src="docs/img/example-peak-light.svg">
 </picture>
+
+## Planning against an uncertain forecast
+
+A PV forecast is a guess, and by default the schedule treats it as fact. `pv_spread` states how far off it may be: the forecast is taken as three scenarios, scaled by `1 - pv_spread`, `1` and `1 + pv_spread`, and the schedule minimizes the expected cost over them rather than the cost of the forecast coming true. `pv_scenario_weights` sets their probabilities, `[0.1, 0.8, 0.1]` by default.
+
+Every time step but the first is planned per scenario, so the schedule may react to the yield it turns out to get. The first step is not: it is the one being decided now, before anything is known, so all three scenarios commit to the same values for it. That is where the hedge shows up. With a cheap hour now and expensive ones later, a schedule planned over the forecast alone waits for the solar it was promised, while one planned over a spread buys some of the shortfall while it is still cheap. The returned schedule carries that decision, followed by the expected scenario for the rest of the horizon, which is a plan to show rather than a commitment.
+
+`pv_spread` at 0, the default, builds exactly the single scenario model and changes nothing.
+
+One term needs a second look when planning this way. An unreachable charge goal is penalized at a hundred times the highest real rate of the request, which is invisible while every scenario reaches the goal but decides the whole schedule once a low yield one does not: the shortfall is then worth avoiding at any price, and the plan protects a goal it will probably make anyway. `prc_e_goal_pen` sets that price per Wh instead. One to a few times the import price weighs the shortfall against money again.
 
 ## API
 
