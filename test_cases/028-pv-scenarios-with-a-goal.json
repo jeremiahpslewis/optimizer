@@ -73,8 +73,7 @@
     "pv_spread": 0.5,
     "pv_scenario_weights": [
       0.1,
-      0.8,
-      0.1
+      0.9
     ],
     "prc_e_goal_pen": 0.0006
   },

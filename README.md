@@ -49,9 +49,13 @@ The maximum is a single value out of the horizon, which leaves one gap: a load s
 
 ## Planning against an uncertain forecast
 
-A PV forecast is a guess, and by default the schedule treats it as fact. `pv_spread` states how far off it may be: the forecast is taken as three scenarios, scaled by `1 - pv_spread`, `1` and `1 + pv_spread`, and the schedule minimizes the expected cost over them rather than the cost of the forecast coming true. `pv_scenario_weights` sets their probabilities, `[0.1, 0.8, 0.1]` by default.
+A PV forecast is a guess, and by default the schedule treats it as fact. `pv_spread` states how far short it may fall: the forecast is taken as two scenarios, scaled by `1 - pv_spread` and by `1`, and the schedule minimizes the expected cost over them rather than the cost of the forecast coming true. `pv_scenario_weights` sets their probabilities, `[0.1, 0.9]` by default, both of them greater than zero.
 
-Every time step but the first is planned per scenario, so the schedule may react to the yield it turns out to get. The first step is not: it is the one being decided now, before anything is known, so all three scenarios commit to the same values for it. That is where the hedge shows up. With a cheap hour now and expensive ones later, a schedule planned over the forecast alone waits for the solar it was promised, while one planned over a spread buys some of the shortfall while it is still cheap. The returned schedule carries that decision, followed by the expected scenario for the rest of the horizon, which is a plan to show rather than a commitment.
+Only the downside is modelled. A solar forecast is not symmetric, the upside is capped by clear sky while the downside is not, and the value of stored energy is concave, so a high yield scenario moves a schedule far less than a low yield one does while costing as much to solve.
+
+Every time step but the first is planned per scenario, so the schedule may react to the yield it turns out to get. The first step is not: it is the one being decided now, before anything is known, so both scenarios commit to the same values for it. That is where the hedge shows up. With a cheap hour now and expensive ones later, a schedule planned over the forecast alone waits for the solar it was promised, while one planned against a shortfall buys some of it while it is still cheap. The returned schedule carries that decision, followed by the expected scenario for the rest of the horizon, which is a plan to show rather than a commitment.
+
+The weights are a threshold rather than a dial: the trade is a corner of the LP, so it flips from no hedge to a hedge at the binding constraint rather than scaling smoothly. With weights `w, 1-w` at a shortfall of `pv_spread`, the standard deviation the schedule effectively plans against is `sqrt(w - w*w) * pv_spread`, well under `pv_spread` itself.
 
 `pv_spread` at 0, the default, builds exactly the single scenario model and changes nothing.
 

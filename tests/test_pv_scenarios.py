@@ -66,17 +66,21 @@ def test_a_spread_replicates_the_horizon_per_scenario():
     spread = build(pv_spread=0.4)
     spread.create_model()
 
-    assert len(spread.scenarios) == 3
-    assert [round(sc.weight, 3) for sc in spread.scenarios] == [0.1, 0.8, 0.1]
-    # the first time step is the one being decided, so its yield is the same everywhere. The rest
-    # of the horizon is scaled.
-    assert [sc.ft[0] for sc in spread.scenarios] == [FT[0]] * 3
-    assert [round(sc.ft[2]) for sc in spread.scenarios] == [2400, 4000, 5600]
+    # the shortfall scenario and the forecast itself, the expected one last because solve()
+    # reports it. Only the downside is modelled, see _build_scenarios.
+    assert len(spread.scenarios) == 2
+    assert [round(sc.weight, 3) for sc in spread.scenarios] == [0.1, 0.9]
+    assert spread.reported_scenario is spread.scenarios[-1]
+    assert spread.reported_scenario.ft == FT
+    # the first time step is the one being decided, so its yield is the same in both. The rest of
+    # the horizon is scaled.
+    assert [sc.ft[0] for sc in spread.scenarios] == [FT[0]] * 2
+    assert [round(sc.ft[2]) for sc in spread.scenarios] == [2400, 4000]
 
     # every time indexed variable exists once per scenario, the peak and demand rate variables
     # stay single. The extra rows are the per scenario constraints plus the tie on the first step.
-    assert len(spread.problem.variables()) == 3 * len(single.problem.variables())
-    assert len(spread.problem.constraints) > 3 * len(single.problem.constraints)
+    assert len(spread.problem.variables()) == 2 * len(single.problem.variables())
+    assert len(spread.problem.constraints) > 2 * len(single.problem.constraints)
 
 
 def test_the_first_time_step_is_one_decision():
@@ -160,18 +164,72 @@ def test_a_realistic_goal_penalty_price_stops_the_worst_case_hoarding():
 
 
 def test_scenario_weights_are_normalized():
-    model = build(pv_spread=0.4, weights=[1, 2, 1])
-    assert [sc.weight for sc in model.scenarios] == [0.25, 0.5, 0.25]
+    model = build(pv_spread=0.4, weights=[1, 3])
+    assert [sc.weight for sc in model.scenarios] == [0.25, 0.75]
+
+
+@pytest.mark.parametrize('weights', [[0.5, 0.5, 0.5], [0.5], [0.0, 1.0], [1.0, 0.0], [-0.5, 1.5]])
+def test_a_weight_of_zero_is_refused_rather_than_solved(weights):
+    # a scenario weighted 0 stays in the model but drops out of the objective, so the solver hands
+    # its variables back unoptimized. One of the two is the schedule that gets reported, and a
+    # returned schedule nothing optimized is worse than a rejected request.
+    with pytest.raises(ValueError):
+        build(pv_spread=0.4, weights=weights)
 
 
 @pytest.mark.parametrize('payload', [
     {'pv_spread': 1.5},
     {'pv_spread': -0.1},
-    {'pv_spread': 0.3, 'pv_scenario_weights': [0.5, 0.5]},
-    {'pv_spread': 0.3, 'pv_scenario_weights': [0.5, -0.5, 1.0]},
-    {'pv_spread': 0.3, 'pv_scenario_weights': [0, 0, 0]},
+    {'pv_spread': 0.3, 'pv_scenario_weights': [0.3, 0.3, 0.4]},
+    {'pv_spread': 0.3, 'pv_scenario_weights': [0.5]},
+    {'pv_spread': 0.3, 'pv_scenario_weights': [-0.5, 1.5]},
+    {'pv_spread': 0.3, 'pv_scenario_weights': [0, 1]},
+    {'pv_spread': 0.3, 'pv_scenario_weights': [1, 0]},
 ])
 def test_invalid_scenario_input_is_rejected(payload):
     request = json.loads(pathlib.Path('test_cases/012-early-charging-not-perfect.json').read_text())['request']
     response = app.test_client().post('/optimize/charge-schedule', json=dict(request, **payload))
     assert response.status_code == 400, response.json
+
+
+def level_peaks(pv_spread=0.0, prc_p_exc_imp=None, **kw):
+    """A grid import the limit cannot hold, on a strategy that levels the import peak."""
+    series = TimeSeriesData(dt=[3600, 3600], gt=kw.pop('gt', [2000, 0]), ft=kw.pop('ft', [0, 0]),
+                            p_N=[0.0003, 0.0003], p_E=[0.0001, 0.0001])
+    return Optimizer(
+        strategy=OptimizationStrategy(charging_strategy='attenuate_demand_peaks',
+                                      discharging_strategy='none'),
+        grid=GridConfig(p_max_imp=100, p_max_exp=None, prc_p_exc_imp=prc_p_exc_imp),
+        batteries=[BatteryConfig(charge_from_grid=False, discharge_to_grid=False, s_capacity=1000,
+                                 s_min=0, s_max=1000, s_initial=0, c_min=0, c_max=0, d_max=0,
+                                 p_a=0.0)],
+        time_series=series, eta_c=0.95, eta_d=0.95, M=1e6, pv_spread=pv_spread, **kw)
+
+
+@pytest.mark.parametrize('pv_spread', [0.0, 0.4])
+def test_the_levelled_peak_counts_the_power_above_the_grid_limit(pv_spread):
+    # the peak the levelling strategies work on is the whole grid power of the side, including the
+    # portion beyond p_max_imp. Reading the excess variables off the wrong dictionary silently
+    # drops that portion and the strategy then levels a 2000 W peak as if it were the 100 W limit.
+    model = level_peaks(pv_spread=pv_spread)
+    assert model.solve()['status'] == 'Optimal'
+
+    # 2000 Wh over an hour against a 100 W limit: 100 Wh of it is regular import, 1900 Wh excess
+    assert pulp.value(model.reported_scenario.variables['n'][0]) == pytest.approx(100, abs=1)
+    assert pulp.value(model.reported_scenario.variables['e_imp_lim_exc'][0]) == pytest.approx(1900, abs=1)
+    assert pulp.value(model.variables['p_imp_peak']) == pytest.approx(2000, abs=1)
+
+
+def test_the_reported_demand_charge_is_the_reported_schedule_s():
+    # the demand rate peak is one variable for all scenarios, so it carries the worst of them.
+    # Charging the reported schedule for it bills an import that schedule does not make: here the
+    # expected scenario covers its load from solar and imports nothing at all.
+    model = level_peaks(pv_spread=0.5, prc_p_exc_imp=0.001, gt=[0, 1000], ft=[0, 1000])
+    result = model.solve()
+    assert result['status'] == 'Optimal'
+
+    # the shortfall scenario has to import, and above the limit, so the shared peak is positive
+    assert pulp.value(model.variables['p_max_imp_exc']) > 100
+    # the reported one does not import at all, and its reported value says so
+    assert result['grid_import'] == pytest.approx([0, 0], abs=1)
+    assert result['objective_value'] == pytest.approx(0, abs=1e-6)

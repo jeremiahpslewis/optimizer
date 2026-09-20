@@ -135,12 +135,12 @@ optimization_input_model = api.model('OptimizationInput', {
     'eta_c': fields.Float(required=False, default=0.95, description='Charging efficiency'),
     'eta_d': fields.Float(required=False, default=0.95, description='Discharging efficiency'),
     'pv_spread': fields.Float(required=False, default=0.0, min=0, max=1,
-                              description='Relative spread of the solar forecast the schedule is planned over. The forecast is taken as three '
-                                          'scenarios, scaled by 1 - pv_spread, 1 and 1 + pv_spread, and the schedule minimizes the expected '
-                                          'cost over them. 0 plans over the forecast alone.'),
+                              description='Relative shortfall of the solar forecast the schedule is planned against. The forecast is taken as '
+                                          'two scenarios, scaled by 1 - pv_spread and by 1, and the schedule minimizes the expected cost over '
+                                          'them. 0 plans over the forecast alone.'),
     'pv_scenario_weights': fields.List(fields.Float, required=False,
-                                       description='Probability of the low yield, the expected and the high yield solar scenario. Normalized '
-                                                   'before use, defaults to [0.1, 0.8, 0.1]. Only read when pv_spread is set.'),
+                                       description='Probability of the low yield and of the expected solar scenario, both greater than zero. '
+                                                   'Normalized before use, defaults to [0.1, 0.9]. Only read when pv_spread is set.'),
     'prc_e_goal_pen': fields.Float(required=False, min=0,
                                    description='Price per Wh of charge goal that cannot be reached (currency units/Wh). Defaults to a hundred '
                                                'times the largest real rate of the request, which reaches the goal at any price. A realistic '
@@ -254,10 +254,12 @@ class OptimizeCharging(Resource):
 
             pv_scenario_weights = data.get('pv_scenario_weights')
             if pv_scenario_weights is not None:
-                if len(pv_scenario_weights) != 3:
-                    api.abort(400, "pv_scenario_weights takes one weight per scenario, three in total")
-                if min(pv_scenario_weights) < 0 or sum(pv_scenario_weights) <= 0:
-                    api.abort(400, "pv_scenario_weights must be non negative and sum to more than zero")
+                if len(pv_scenario_weights) != 2:
+                    api.abort(400, "pv_scenario_weights takes one weight per scenario, two in total")
+                # a weight of zero leaves its scenario in the model but out of the objective, so
+                # the solver returns it unoptimized, and one of the two is the reported schedule
+                if min(pv_scenario_weights) <= 0:
+                    api.abort(400, "every pv_scenario_weights entry must be greater than zero")
 
         except Exception as e:
             api.abort(400, f"Invalid data format: {str(e)}")

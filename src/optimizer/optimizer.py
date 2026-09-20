@@ -138,9 +138,9 @@ class BatteryConfig:
     c_priority: int = 0
 
 
-# probability of the low yield, the expected and the high yield PV scenario. Only read when a
-# spread is given, a spread of 0 keeps the single scenario model.
-DEFAULT_PV_SCENARIO_WEIGHTS = (0.1, 0.8, 0.1)
+# probability of the low yield and of the expected PV scenario. Only read when a spread is given,
+# a spread of 0 keeps the single scenario model.
+DEFAULT_PV_SCENARIO_WEIGHTS = (0.1, 0.9)
 
 
 @dataclass
@@ -197,9 +197,9 @@ class Optimizer:
         # PV scenarios the model plans over, generated from the single forecast of the request
         self.pv_spread = pv_spread
         self.scenarios = self._build_scenarios(pv_spread, pv_scenario_weights)
-        # the scenario whose schedule is reported. The expected one, which is the only one when no
-        # spread is given.
-        self.reported_scenario = self.scenarios[len(self.scenarios) // 2]
+        # the scenario whose schedule is reported. The expected one, which _build_scenarios puts
+        # last and which is the only one when no spread is given.
+        self.reported_scenario = self.scenarios[-1]
         # the optimization problem
         self.problem = None
         # factor the objective went to the solver with, set by _setup_target_function
@@ -272,8 +272,14 @@ class Optimizer:
 
     def _build_scenarios(self, pv_spread: float, weights: Optional[List[float]]) -> List[PvScenario]:
         """
-        The PV scenarios to plan over, the forecast of the request scaled by 1 - spread, 1 and
-        1 + spread.
+        The PV scenarios to plan over: the forecast scaled by 1 - spread, and the forecast itself.
+
+        Only the downside is modelled. A PV forecast is not symmetric, the upside is capped by
+        clear sky while the downside is not, and the value of stored energy is concave, so a high
+        yield scenario changes a schedule far less than a low yield one does while costing as much
+        to solve. See the PR for the measurements.
+
+        The expected scenario comes last, solve() reports its schedule.
 
         The first time step keeps the forecast unscaled, it is the step being decided rather than
         planned: the schedule commits to one set of values for it, and a yield that differs between
@@ -288,11 +294,14 @@ class Optimizer:
             return [PvScenario(weight=1.0, ft=self.time_series.ft, suffix='')]
 
         weights = list(DEFAULT_PV_SCENARIO_WEIGHTS if weights is None else weights)
-        factors = (1. - pv_spread, 1., 1. + pv_spread)
+        factors = (1. - pv_spread, 1.)
         if len(weights) != len(factors):
             raise ValueError(f"pv_scenario_weights needs one weight per scenario, {len(factors)} in total")
-        if min(weights) < 0 or sum(weights) <= 0:
-            raise ValueError("pv_scenario_weights must be non negative and sum to more than zero")
+        # every scenario strictly positive, not merely non negative. A weight of 0 drops its
+        # scenario out of the objective while leaving its variables in the model, so they come back
+        # from the solver unoptimized, and on the reported scenario that is the returned schedule.
+        if min(weights) <= 0:
+            raise ValueError("every pv_scenario_weights entry must be greater than zero")
 
         # normalized, so the weighted objective stays an expectation and terms on scenario
         # independent variables keep their coefficient
@@ -693,7 +702,7 @@ class Optimizer:
             p_grid = []
             for t in self.time_steps:
                 e_grid = sc.variables[grid_var][t]
-                if lim_exc_var in self.variables:
+                if lim_exc_var in sc.variables:
                     e_grid = e_grid + sc.variables[lim_exc_var][t]
                 p_grid.append(e_grid * 3600 / self.time_series.dt[t])
 
@@ -1138,9 +1147,13 @@ class Optimizer:
                                 - bat.s_initial) * bat.p_a
 
         # charge for import power demand rate. The demand rate is applied to the maximum
-        # power draw beyond the threshold within the time horizon.
+        # power draw beyond the threshold within the time horizon. Recomputed from the reported
+        # schedule rather than read off p_max_imp_exc: that variable is shared by the scenarios and
+        # therefore carries the worst of them, which would charge the reported schedule for an
+        # import it does not make.
         if self.is_grid_demand_rate_active:
-            clean_objective += - self.grid.prc_p_exc_imp \
-                * pulp.value(self.variables['p_max_imp_exc'])
+            clean_objective += - self.grid.prc_p_exc_imp * max(
+                (pulp.value(self.reported_scenario.variables['e_imp_lim_exc'][t]) * 3600. / self.time_series.dt[t]
+                 for t in self.time_steps), default=0.)
 
         return clean_objective
