@@ -187,8 +187,10 @@ battery_config_model = api.model('BatteryConfig', {
     'd_max': fields.Float(required=True, min=0, description='Maximum discharge power (W)'),
     'p_a': fields.Float(required=True, description='Monetary value per Wh at end of the optimization horizon'),
     'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.'),
-    'eta_c': fields.Float(required=False, description='Charging efficiency (0 to 1), overrides the top level default'),
-    'eta_d': fields.Float(required=False, description='Discharging efficiency (0 to 1), overrides the top level default')
+    'eta_c': fields.Float(required=False, exclusiveMin=0, max=1, example=0.95,
+                          description='Charging efficiency (0 to 1), overrides the top level default'),
+    'eta_d': fields.Float(required=False, exclusiveMin=0, max=1, example=0.95,
+                          description='Discharging efficiency (0 to 1), overrides the top level default')
 })
 
 time_series_model = api.model('TimeSeries', {

@@ -364,12 +364,14 @@ components:
         eta_c:
           type: number
           minimum: 0
+          exclusiveMinimum: true
           maximum: 1
           description: Charging efficiency (0 to 1). Overrides the top level eta_c for this battery.
           example: 0.95
         eta_d:
           type: number
           minimum: 0
+          exclusiveMinimum: true
           maximum: 1
           description: Discharging efficiency (0 to 1). Overrides the top level eta_d for this battery.
           example: 0.95
