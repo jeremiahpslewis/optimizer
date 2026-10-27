@@ -214,11 +214,14 @@ def digest(payload):
     ts = req['time_series']
     labels = step_labels(ts['dt'], details.get('timestamp'))
 
+    eta_c, eta_d = req.get('eta_c', 0.95), req.get('eta_d', 0.95)
     titles, devices, capacities = [], [], []
     for i, bat in enumerate(req['batteries']):
         detail = at(details.get('batteryDetails'), i, {})
         capacities.append(capacity_wh(bat, detail))
         title, line = battery_line(bat, detail, i, labels, capacities[-1])
+        if 'eta_c' in bat or 'eta_d' in bat:
+            line += f", charging efficiency {bat.get('eta_c', eta_c)} and discharging efficiency {bat.get('eta_d', eta_d)}"
         titles.append(title)
         devices.append(line)
 
@@ -235,7 +238,7 @@ def digest(payload):
 
     lines = [
         f"Now: {labels[0]}. The plan runs until {labels[-1]}. Status {res['status']}. Preference: {strategy}.",
-        f"Prices in {unit}/kWh, energies in kWh. Charging and discharging efficiency {req.get('eta_c', 0.95)} and {req.get('eta_d', 0.95)}.",
+        f"Prices in {unit}/kWh, energies in kWh. Charging and discharging efficiency {eta_c} and {eta_d} unless a device states its own.",
         *(f'{n}.' for n in notes if n),
         *([f"The household load includes {', '.join(demands)}."] if demands else []),
         'Vehicles and home batteries:',

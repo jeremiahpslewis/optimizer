@@ -280,6 +280,21 @@ def test_per_battery_efficiency():
     assert numpy.isclose(response.json["batteries"][1]["state_of_charge"][0], 500)
 
 
+@pytest.mark.parametrize("eta", [0, 1.2])
+def test_per_battery_efficiency_out_of_range_is_rejected(eta):
+    # a discharging efficiency of 0 divides by zero in the state of charge evolution
+    client = app.test_client()
+    request = {
+        "batteries": [{
+            "s_min": 0, "s_max": 10000, "s_initial": 5000,
+            "c_min": 0, "c_max": 5000, "d_max": 5000, "p_a": 0.1, "eta_d": eta,
+        }],
+        "time_series": {"dt": [3600], "gt": [1000], "ft": [0], "p_N": [0.3], "p_E": [0.1]},
+    }
+    response = client.post("/optimize/charge-schedule", json=request)
+
+    assert response.status_code == 400
+
 
 def test_abort_returns_json_message():
     # message-only api.abort(400, ...) must return a JSON body, not an empty response
